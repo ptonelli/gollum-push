@@ -17,42 +17,96 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $*"; }
 # Ensure inotifywait exists
 command -v inotifywait >/dev/null 2>&1 || { log "ERROR: inotifywait not found (install inotify-tools)"; exit 1; }
 
+log "Configuration:"
+log "  Wiki directory: $WIKI_DIR"
+log "  Remote repository: $REMOTE_REPO"
+
+# ==============================================================================
+# 1. SSH known_hosts setup (MOVED UP)
+# Must be done BEFORE cloning
+# ==============================================================================
+GIT_SERVER=""
+GIT_PORT=""
+
+if echo "$REMOTE_REPO" | grep -q "^https://"; then
+  log "HTTPS detected in REMOTE_REPO. Skipping SSH known_hosts setup."
+elif echo "$REMOTE_REPO" | grep -q "^ssh://"; then
+  # Format: ssh://[user@]host[:port]/repo.git
+  GIT_SERVER=$(echo "$REMOTE_REPO" | sed -E 's#^ssh://(git@)?([^:/]+).*#\2#')
+  GIT_PORT=$(echo "$REMOTE_REPO" | sed -nE 's#^ssh://.*:([0-9]+)/.*#\1#p')
+else
+  # Format: git@server:repo.git
+  GIT_SERVER=$(echo "$REMOTE_REPO" | sed -n 's/.*git@\([^:]*\).*/\1/p')
+fi
+
+# Only run ssh-keyscan if we extracted a server hostname
+if [ -n "$GIT_SERVER" ]; then
+  # Set up SSH known_hosts file if it doesn't exist
+  if [ ! -f "$HOME/.ssh/known_hosts" ] || ! grep -q "$GIT_SERVER" "$HOME/.ssh/known_hosts"; then
+    log "Setting up SSH known_hosts for $GIT_SERVER ${GIT_PORT:+on port $GIT_PORT}"
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+
+    # Use custom port if detected, otherwise default
+    if [ -n "$GIT_PORT" ]; then
+        # We use 'ssh' instead of 'keyscan' to trigger sslh protocol detection
+        # strict checking=no writes the key to UserKnownHostsFile automatically
+        ssh -p "$GIT_PORT" \
+            -o HostKeyAlgorithms=ssh-rsa \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o CheckHostIP=no \
+            -o LogLevel=ERROR \
+            -o BatchMode=yes \
+            "git@$GIT_SERVER" true >/dev/null 2>&1 || true
+    else
+        ssh-keyscan -t rsa "$GIT_SERVER" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+    fi
+
+    if [ $? -ne 0 ]; then
+      log "WARNING: Failed to add $GIT_SERVER to known_hosts"
+    else
+      log "Added $GIT_SERVER to known_hosts file"
+    fi
+  fi
+elif ! echo "$REMOTE_REPO" | grep -q "^https://"; then
+  log "WARNING: Could not extract Git server from REMOTE_REPO for SSH setup."
+fi
+
+# ==============================================================================
+# 2. Directory Check & Auto-Clone
+# ==============================================================================
+
+# Create directory if it doesn't exist
+if [ ! -d "$WIKI_DIR" ]; then
+  log "Directory $WIKI_DIR does not exist. Creating it..."
+  mkdir -p "$WIKI_DIR"
+fi
+
 # Change to the wiki directory
 cd "$WIKI_DIR" 2>/dev/null || { log "ERROR: Cannot change to directory $WIKI_DIR"; exit 1; }
-[ -d ".git" ] || { log "ERROR: $WIKI_DIR is not a git repository"; exit 1; }
 
-log "Starting Git backup sidecar for Gollum wiki"
-log "Wiki directory: $WIKI_DIR"
-log "Remote repository: $REMOTE_REPO"
+# Check for .git, clone if missing
+if [ ! -d ".git" ]; then
+  log "No git repository found in $WIKI_DIR. Attempting to clone..."
+
+  # Clone into current directory (.)
+  # Note: This requires the directory to be empty (or almost empty)
+  if git clone "$REMOTE_REPO" .; then
+    log "Clone successful."
+  else
+    log "ERROR: Git clone failed. Check permissions or network."
+    exit 1
+  fi
+fi
+
+# ==============================================================================
+# 3. Git Configuration & Loop
+# ==============================================================================
 
 # Detect current branch (fallback to master)
 BRANCH="${BRANCH:-$(git symbolic-ref --short HEAD 2>/dev/null || echo master)}"
-log "Branch: $BRANCH"
-
-# ----- SSH known_hosts setup (kept as-is) -----
-# Extract Git server hostname from the repository URL
-# Format: git@server:repo.git or git@server/repo.git
-GIT_SERVER=$(echo "$REMOTE_REPO" | sed -n 's/git@\([^:]*\).*/\1/p')
-
-if [ -z "$GIT_SERVER" ]; then
-  log "ERROR: Could not extract Git server from REMOTE_REPO. Format should be git@server:repo.git"
-  exit 1
-fi
-
-# Set up SSH known_hosts file if it doesn't exist
-if [ ! -f "$HOME/.ssh/known_hosts" ] || ! grep -q "$GIT_SERVER" "$HOME/.ssh/known_hosts"; then
-  log "Setting up SSH known_hosts for $GIT_SERVER"
-  mkdir -p "$HOME/.ssh"
-  chmod 700 "$HOME/.ssh"
-  ssh-keyscan -t rsa "$GIT_SERVER" >> "$HOME/.ssh/known_hosts" 2>/dev/null
-
-  if [ $? -ne 0 ]; then
-    log "WARNING: Failed to add $GIT_SERVER to known_hosts"
-  else
-    log "Added $GIT_SERVER to known_hosts file"
-  fi
-fi
-# ----------------------------------------------
+log "Branch detected: $BRANCH"
 
 # Configure remote repository
 configure_remote() {
@@ -102,4 +156,3 @@ while true; do
   [ "$DEBOUNCE" -gt 0 ] && sleep "$DEBOUNCE"
   sync_once || true
 done
-
